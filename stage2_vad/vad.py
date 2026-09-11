@@ -1,62 +1,50 @@
 """
-Stage 2: Voice Activity Detection (VAD)
+Stage 2: voice activity detection.
 
-Goal: instead of just printing volume, use Silero VAD to detect actual
-speech, and print "speech started" / "speech stopped" events as you talk.
+Runs Silero VAD on every incoming block and prints when speech starts and
+stops. The model is the easy part. The interesting bit is deciding that
+speech has *stopped*, which means waiting out a run of quiet blocks, because
+a pause in the middle of a sentence and a pause at the end of one look
+exactly the same to the detector.
 
-Fill in the TODOs. Run with:  uv run stage2_vad/vad.py
-Stop with Ctrl+C.
+Run with:  uv run stage2_vad/vad.py
 """
+
+from datetime import datetime
 
 import numpy as np
 import sounddevice as sd
 import torch
-from datetime import datetime
 
 SAMPLE_RATE = 16000
-# Silero VAD requires exactly 512 samples per call at 16kHz (32ms of audio).
+# Silero requires exactly 512 samples per call at 16kHz, which is 32ms.
 BLOCK_SIZE = 512
 
-SPEECH_THRESHOLD = 0.5  # probability above which we consider a chunk "speech"
+SPEECH_THRESHOLD = 0.5  # probability above which a block counts as speech
 
-HANGOVER_CHUNKS = 12 # consecutive 32ms audio duration for detecting speech pause
+# Consecutive quiet blocks before calling the turn over: 12 * 32ms = ~384ms.
+# Too low and it interrupts mid-thought, too high and it feels sluggish.
+HANGOVER_CHUNKS = 12
 
-# Model loading is plumbing, done for you.
 model, _utils = torch.hub.load(
     repo_or_dir="snakers4/silero-vad", model="silero_vad", trust_repo=True
 )
 
-# TODO 1: you'll need some state that persists *between* callback calls, so
-# you know whether you were already "in speech" on the previous chunk (to
-# detect the *transition* from not-speech -> speech, and speech -> not-speech,
-# rather than printing every single chunk). A mutable container like a dict
-# or a class works well here since `audio_callback` can't easily reassign a
-# plain outer variable. Define that state before `audio_callback`.
+# The callback runs on its own thread and cannot rebind names from out here,
+# so anything that has to survive between blocks lives in this dict.
 state = {"is_speaking": False, "silence_chunks": 0}
 
 
-def audio_callback(indata: np.ndarray, frames: int, time, status) -> None:
+def audio_callback(indata: np.ndarray, _frames: int, _time, status) -> None:
     if status:
         print(status)
 
-    # TODO 2: convert `indata` (numpy array, shape (BLOCK_SIZE, 1)) into the
-    # 1D torch.Tensor shape the model expects: (BLOCK_SIZE,).
-    # Hint: torch.from_numpy(...) then .squeeze() or reshape.
+    # (BLOCK_SIZE, 1) from sounddevice -> (BLOCK_SIZE,) for the model.
     audio_tensor = torch.from_numpy(indata).squeeze()
-    # print(audio_tensor.shape)
-
-    # TODO 3: call the model to get a speech probability for this chunk.
-    # Hint: speech_prob = model(audio_tensor, SAMPLE_RATE).item()
     speech_prob = model(audio_tensor, SAMPLE_RATE).item()
-    # print(speech_prob)
 
-    # TODO 4: using `state["is_speaking"]` and `speech_prob` vs
-    # SPEECH_THRESHOLD, detect the *transition*:
-    #   - if we were NOT speaking and now prob is above threshold -> print
-    #     "speech started" and update state
-    #   - if we WERE speaking and now prob is below threshold -> print
-    #     "speech stopped" and update state
-    #   - otherwise, do nothing (avoid spamming prints every 32ms)
+    # Only the transitions are worth printing; otherwise this fires 31 times
+    # a second forever.
     if not state["is_speaking"]:
         if speech_prob > SPEECH_THRESHOLD:
             print(f"speech started: {datetime.now()}")
@@ -64,13 +52,12 @@ def audio_callback(indata: np.ndarray, frames: int, time, status) -> None:
             state["silence_chunks"] = 0
     else:
         if speech_prob > SPEECH_THRESHOLD:
-             state["silence_chunks"] = 0
+            state["silence_chunks"] = 0
         else:
-            state["silence_chunks"] = state["silence_chunks"] + 1
+            state["silence_chunks"] += 1
             if state["silence_chunks"] >= HANGOVER_CHUNKS:
                 print(f"speech stopped: {datetime.now()}")
                 state["is_speaking"] = False
-           
 
 
 def main() -> None:
