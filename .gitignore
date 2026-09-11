@@ -6,6 +6,11 @@ __pycache__/
 debug_last_utterance.wav
 stage6_orchestration/debug_live_output.wav
 
+# Piper voice models are ~60MB each. Each stage README has the one-line
+# command to fetch them.
+stage5_tts/voices/*.onnx
+stage5_tts/voices/*.onnx.json
+
 # depth_aec/*.npy is deliberately committed: Piper's output is not
 # deterministic across runs, so the experiments load cached audio to stay
 # reproducible.
