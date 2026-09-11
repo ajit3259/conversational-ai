@@ -1,53 +1,54 @@
 """
-Stage 1: Mic capture
+Stage 1: mic capture.
 
-Goal: open the default microphone and print the volume (RMS) of each
-incoming audio chunk in real time, so you can see live audio flowing
-through your program before we add VAD/ASR/etc on top.
+Opens the default input device and prints the loudness of each incoming
+block. The point is to watch audio arrive as a steady drip of fixed-size
+number arrays: the hardware clock decides when the callback fires, not
+anything about the sound itself. Silence is not an absence of blocks, it
+is blocks full of near-zero samples.
 
-Fill in the TODOs. Run with:  uv run stage1_mic_capture/capture.py
-Stop with Ctrl+C.
+Run with:  uv run stage1_mic_capture/capture.py
 """
+
+import math
 
 import numpy as np
 import sounddevice as sd
-import math
 
-SAMPLE_RATE = 16000  # samples per second (Hz). 16kHz is standard for speech models.
-BLOCK_DURATION_MS = 30  # how many milliseconds of audio per callback
+SAMPLE_RATE = 16000  # 16kHz: the rate the speech models downstream expect
+BLOCK_DURATION_MS = 30
 BLOCK_SIZE = int(SAMPLE_RATE * BLOCK_DURATION_MS / 1000)
 
+# log10 runs off to -inf as rms approaches zero, and "silence" on a real mic
+# is just float noise near zero. Clamp before the log so the dB reading stays
+# meaningful instead of swinging wildly.
+RMS_FLOOR = 1e-8
 
-def audio_callback(indata: np.ndarray, frames: int, time, status) -> None:
+
+def audio_callback(indata: np.ndarray, _frames: int, _time, status) -> None:
     if status:
         print(status)
 
-    # TODO 1: compute the RMS (root-mean-square) volume of `indata`.
-    # indata has shape (frames, channels) and dtype float32, values in [-1, 1].
-    # RMS = sqrt(mean(samples^2))
-    rms = np.sqrt(np.mean(indata**2))  # replace with your computation
+    # indata is (frames, channels), float32 in [-1, 1]. A single sample says
+    # nothing about loudness -- it is one instantaneous amplitude, and it can
+    # be negative. RMS collapses the whole block into one number: square to
+    # drop the sign, average, then root back to the original scale.
+    rms = np.sqrt(np.mean(indata**2))
 
-    # TODO 2: print something like a simple volume meter, e.g.
-    # print(f"{rms:.4f}")
-    print(f"RMS is {rms:.4f}")
-    # log10(rms) blows up toward -infinity as rms -> 0 (pure float noise during
-    # silence), so production code clamps rms to a small floor (e.g. 1e-8)
-    # before taking the log, to keep dB readings meaningful.
-    print(f"decibels (dBFS): {20 * math.log10(rms)}")
+    # dBFS is measured against the loudest representable signal (amplitude
+    # 1.0), so real audio always reads negative. 0 dBFS is the clipping
+    # ceiling, not a target.
+    dbfs = 20 * math.log10(max(rms, RMS_FLOOR))
+    print(f"rms {rms:.4f}   dBFS {dbfs:6.1f}")
 
 
 def main() -> None:
-    # TODO 3: open a sd.InputStream using SAMPLE_RATE, BLOCK_SIZE, mono (channels=1),
-    # dtype="float32", and audio_callback as the callback.
-    # Hint: sd.InputStream is a context manager -- use it in a `with` block,
-    # then just sleep/wait forever (e.g. `while True: sd.sleep(1000)`) since
-    # the callback runs on its own thread.
     with sd.InputStream(
         samplerate=SAMPLE_RATE,
         blocksize=BLOCK_SIZE,
         channels=1,
         dtype="float32",
-        callback=audio_callback
+        callback=audio_callback,
     ):
         while True:
             sd.sleep(1000)
