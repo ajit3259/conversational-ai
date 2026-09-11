@@ -1,12 +1,16 @@
 """
-Stage 3: Streaming ASR (segment-then-transcribe)
+Stage 3: segment-then-transcribe ASR.
 
-Goal: reuse Stage 2's VAD start/stop detection, but this time buffer the
-audio while the person is speaking, and once they stop, transcribe the
-whole utterance with faster-whisper and print the text.
+Reuses Stage 2's start/stop detection, but buffers the audio while somebody
+is speaking and transcribes the whole utterance once they stop. This is not
+true streaming recognition -- nothing is transcribed until the turn is over,
+so the wait lands directly in the gap before the reply.
 
-Fill in the TODOs. Run with:  uv run stage3_asr/asr.py
-Stop with Ctrl+C.
+Note the buffer starts with the block that *triggered* detection. Dropping
+it clips the first syllable off every utterance, which looks like a bad
+speech model rather than a bookkeeping mistake.
+
+Run with:  uv run stage3_asr/asr.py
 """
 
 import numpy as np
@@ -16,44 +20,40 @@ import torch
 from faster_whisper import WhisperModel
 
 SAMPLE_RATE = 16000
-BLOCK_SIZE = 512  # Silero VAD requirement at 16kHz
+BLOCK_SIZE = 512  # Silero requirement at 16kHz
 
 SPEECH_THRESHOLD = 0.5
 HANGOVER_CHUNKS = 12  # ~384ms of continuous silence to confirm "stopped"
 
-# Model loading is plumbing, done for you.
+# Written out on every utterance so the exact audio handed to Whisper can be
+# played back. Listening to the input is the fastest way to tell a bad
+# transcript apart from a bad recording.
+DEBUG_WAV = "debug_last_utterance.wav"
+
 vad_model, _utils = torch.hub.load(
     repo_or_dir="snakers4/silero-vad", model="silero_vad", trust_repo=True
 )
 asr_model = WhisperModel("small", device="cpu", compute_type="int8")
 
-# TODO 1: extend the state dict from Stage 2 with something to hold the
-# buffered audio chunks while the person is speaking (e.g. "audio_buffer": []).
 state = {"is_speaking": False, "silence_chunks": 0, "audio_buffer": []}
 
 
 def transcribe(audio_chunks: list[np.ndarray]) -> None:
-    # TODO 2: concatenate the list of chunk arrays into a single 1D float32
-    # numpy array. Hint: np.concatenate(...) on the list, then check/adjust
-    # shape -- transcribe() wants 1D, but your chunks are (BLOCK_SIZE, 1).
-    full_audio = np.concat(audio_chunks)
-    print(full_audio.shape)
-    sf.write("debug_last_utterance.wav", full_audio, SAMPLE_RATE)
+    full_audio = np.concatenate(audio_chunks)
+    sf.write(DEBUG_WAV, full_audio, SAMPLE_RATE)
 
-    # TODO 3: call asr_model.transcribe(full_audio) -- it returns
-    # (segments, info). Iterate over `segments` and print each segment's
-    # `.text`.
     segments, _ = asr_model.transcribe(full_audio, language="en")
     for segment in segments:
         print(segment.text)
 
 
-def audio_callback(indata: np.ndarray, frames: int, time, status) -> None:
+def audio_callback(indata: np.ndarray, _frames: int, _time, status) -> None:
     if status:
         print(status)
 
-    indata_copy = indata.copy()
-    audio_tensor = torch.from_numpy(indata_copy).squeeze()
+    # sounddevice reuses its input buffer between calls, so copy before
+    # holding onto it.
+    audio_tensor = torch.from_numpy(indata.copy()).squeeze()
     speech_prob = vad_model(audio_tensor, SAMPLE_RATE).item()
 
     if not state["is_speaking"]:
@@ -61,14 +61,10 @@ def audio_callback(indata: np.ndarray, frames: int, time, status) -> None:
             print("speech started")
             state["is_speaking"] = True
             state["silence_chunks"] = 0
-            # TODO 4: reset/start the audio buffer for this new utterance.
-            state["audio_buffer"] = []
-            state["audio_buffer"].append(audio_tensor)
+            state["audio_buffer"] = [audio_tensor]
     else:
-        # TODO 5: regardless of speech or silence, while we're in the
-        # "is_speaking" state we still want to keep buffering audio (the
-        # silent tail matters less, but simplest is to just always append
-        # `indata` to the buffer here before the threshold check below).
+        # Keep buffering through the quiet tail too -- we only know the turn
+        # ended after the fact, and the tail is cheap to include.
         state["audio_buffer"].append(audio_tensor)
 
         if speech_prob > SPEECH_THRESHOLD:
@@ -78,11 +74,8 @@ def audio_callback(indata: np.ndarray, frames: int, time, status) -> None:
             if state["silence_chunks"] >= HANGOVER_CHUNKS:
                 print("speech stopped")
                 state["is_speaking"] = False
-                # TODO 6: call transcribe() with the buffered audio now
-                # that the utterance is complete.
                 transcribe(state["audio_buffer"])
                 state["audio_buffer"] = []
-
 
 
 def main() -> None:
