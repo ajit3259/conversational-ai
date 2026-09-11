@@ -1,14 +1,20 @@
 """
-Stage 5: Streaming TTS
+Stage 5: streaming TTS.
 
-Goal: synthesize speech from text using Piper, playing each sentence's
-audio as soon as it's ready rather than waiting for the whole text to be
-synthesized -- the TTS-side mirror of Stage 4's token streaming.
+Piper hands back one audio chunk per sentence, so playback can start on the
+first sentence while the rest is still being synthesised. The timestamps
+printed here are the point: chunks arrive spread out over time rather than
+all at once at the end.
 
-Fill in the TODOs. Run with:  uv run stage5_tts/tts.py
+Each chunk carries its own sample rate, which is whatever the voice model
+was trained at (22050Hz for this voice) and not the 16kHz the rest of the
+pipeline runs at.
+
+Run with:  uv run stage5_tts/tts.py
 """
 
 import time
+
 import sounddevice as sd
 from piper import PiperVoice
 
@@ -22,22 +28,13 @@ TEXT = (
 
 
 def main() -> None:
-    # Plumbing: loading the voice model is done for you.
     voice = PiperVoice.load(VOICE_MODEL_PATH)
 
-    # TODO 1: call voice.synthesize(TEXT) -- it returns a generator of
-    # AudioChunk objects, one per sentence. Iterate over it.
     for chunk in voice.synthesize(TEXT):
-        # TODO 2: print a timestamp (e.g. time.time()) right when you
-        # receive each chunk, so we can later verify sentences are arriving
-        # (and being played) incrementally rather than all at once.
-        print("Received audio chunk at: ", time.time())
+        print(f"chunk received at {time.time():.3f} ({chunk.sample_rate}Hz)")
 
-        # TODO 3: play the chunk's audio using sounddevice. Hint:
-        # sd.play(chunk.audio_float_array, chunk.sample_rate) starts
-        # playback, but returns immediately (non-blocking) -- you need
-        # sd.wait() right after to block until that chunk finishes playing
-        # before moving on to synthesize/play the next one.
+        # sd.play returns immediately, so wait for this sentence to finish
+        # before synthesising and playing the next one.
         sd.play(chunk.audio_float_array, chunk.sample_rate)
         sd.wait()
 
