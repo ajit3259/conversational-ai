@@ -1,0 +1,16 @@
+[project]
+name = "stage7-pipecat"
+version = "0.1.0"
+description = "The same voice assistant, assembled from a framework instead of by hand"
+requires-python = ">=3.12"
+dependencies = [
+    "pipecat-ai[silero,whisper,piper,webrtc,runner]>=1.9.0",
+    # Pipecat's Whisper module imports mlx_whisper unconditionally on Apple
+    # Silicon, even when the faster-whisper backend is the one being used, so
+    # the module will not import at all without it there.
+    "pipecat-ai[mlx-whisper]>=1.9.0 ; sys_platform == 'darwin' and platform_machine == 'arm64'",
+]
+
+# Deliberately a separate project from the repo root. The hand-rolled stages
+# pin their own versions of torch and faster-whisper, and there is no reason
+# to make those two dependency sets agree with each other.

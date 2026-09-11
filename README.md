@@ -46,6 +46,11 @@ the previous one ran into a problem it could not solve.
 | [5 · TTS](stage5_tts) | Turning text back into sound | voice model |
 | [6 · orchestration](stage6_orchestration) | All of it, live, with interruption | all of the above |
 | [depth: AEC](depth_aec) | Cancelling the assistant's own voice | — |
+| [7 · pipecat](stage7_pipecat) | The same assistant, assembled not built | Ollama, a browser |
+
+Stage 7 is the ending the earlier stages argue for: the same four models,
+wired by a framework, with every seam already solved. It is a separate uv
+project with its own dependencies.
 
 `DOUBTS.md` is a running log of questions raised while working through each
 stage, with the answers where there are any.
