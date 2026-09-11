@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.pyc
+
+# Debug recordings the stages write while running.
+debug_last_utterance.wav
+stage6_orchestration/debug_live_output.wav
+
+# depth_aec/*.npy is deliberately committed: Piper's output is not
+# deterministic across runs, so the experiments load cached audio to stay
+# reproducible.
