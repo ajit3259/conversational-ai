@@ -72,7 +72,63 @@ than the 32ms a block covers, which is the pipeline falling behind the
 microphone.
 
 On exit it writes `debug_live_output.wav` — the exact samples sent to the
-speaker. If that file plays back clean but live playback crackled, the
-problem is the hardware's duplex handling rather than anything in this code.
-That is what happened here, and a linear filter structurally cannot cancel
-non-linear hardware distortion.
+speaker. That file played back clean while live playback crackled, which at
+first looked like a hardware limit. Passes D and E found otherwise.
+
+## Pass D — native rate, and what was actually wrong
+
+```bash
+uv run stage6_orchestration/assistant_aec_48k.py
+```
+
+An investigation more than an improvement, kept because of what it found.
+Every figure below was measured, not assumed:
+
+- **The crackle was a missed deadline.** The per-sample filter took the full
+  32ms of a 32ms block under load. A late callback underruns the speaker, so
+  the echo canceller was producing the glitches. Rewriting it as vectorised
+  block updates took it to about 0.4ms and the crackle went away.
+- **The rewrite diverged at first.** Summing a block of gradients and
+  normalising by one window's energy made each step hundreds of times too
+  large. Only comparing against the offline reference in `depth_aec/` caught
+  it.
+- **The filter cancelled nothing because the echo was too late.** On this
+  laptop the mic hears the speaker 294ms after it plays; the filter could see
+  100ms back. `measure_echo_delay.py` reads the capture pass D saves and
+  reports the delay. Compensating for it took ERLE from about 0dB to +7 to
+  +10dB.
+- **Resampling and non-linearity were ruled out** by replaying the same
+  recording through both candidates.
+
+The constants in this file are measured on one machine and should be treated
+that way. It still hears itself at +10dB, because a linear filter alone is
+never enough — which is where pass E comes in.
+
+## Pass E — WebRTC's echo canceller
+
+```bash
+uv run stage6_orchestration/assistant_webrtc_apm.py
+```
+
+The same pipeline with echo cancellation handed to WebRTC's audio processing
+module, the code Chrome and Google Meet use, via the prebuilt wheel in the
+`livekit` package. Nothing to compile.
+
+On the same recording from pass D:
+
+| Canceller | ERLE |
+| --- | --- |
+| Our filter, delay-compensated | +7.6 dB |
+| WebRTC, no delay hint | +37.7 dB |
+| WebRTC, measured delay as a hint | +43.9 dB |
+| WebRTC, hint and noise suppression | +55.2 dB |
+
+The gap is the layers we never built. WebRTC finds the delay itself — note
++37.7dB with no hint at all — and after its linear filter it suppresses
+whatever echo is left, which is what actually makes a call sound clean.
+
+It also takes the lesson from pass D structurally. The callback runs every
+10ms and does only what has to happen on the audio clock: play the next
+frame, and feed the speaker and mic signals to the canceller at the same
+instant. Voice detection moved to its own thread, so a slow call there delays
+a decision instead of glitching the audio.
