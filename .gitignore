@@ -14,3 +14,7 @@ stage5_tts/voices/*.onnx.json
 # depth_aec/*.npy is deliberately committed: Piper's output is not
 # deterministic across runs, so the experiments load cached audio to stay
 # reproducible.
+
+# Raw mic/speaker capture from stage 6 pass D, for offline AEC analysis.
+stage6_orchestration/debug_aec_capture.npz
+stage6_orchestration/debug_live_output_48k.wav

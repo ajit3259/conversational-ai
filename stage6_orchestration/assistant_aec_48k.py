@@ -54,6 +54,12 @@ OUTPUT_GAIN = 0.8
 SPEECH_THRESHOLD = 0.5
 HANGOVER_CHUNKS = 12
 
+# Consecutive speech blocks required to believe a barge-in while the
+# assistant is talking. One block of residual echo is indistinguishable
+# from speech; 160ms of it is not. A person interrupting easily clears
+# this, a convergence transient does not.
+BARGE_IN_CHUNKS = 5
+
 LLM_URL = "http://localhost:11434/v1/chat/completions"
 MODEL = "gemma3n:e4b"
 SYSTEM_PROMPT = {
@@ -69,7 +75,27 @@ SYSTEM_PROMPT = {
 VOICE_MODEL_PATH = "stage5_tts/voices/en_US-lessac-medium.onnx"
 
 FILTER_LENGTH = 1600  # ~100ms of echo tail at 16kHz
-STEP_SIZE = 0.1
+
+# How long after we write audio the mic actually hears it: output buffering,
+# the DAC, the air, the ADC and input buffering added together. Measured by
+# cross-correlating a recording of this machine's speaker and mic, which came
+# to 294ms -- nearly three times the filter's 100ms reach, so the filter was
+# looking for the echo in a window it never arrived in and cancelled nothing.
+# Delaying the reference lines the two up and leaves the filter only the room
+# tail to model. Set 20ms short of the measured delay so the direct path lands
+# inside the window. Device- and latency-specific: re-measure with
+# measure_echo_delay.py on other hardware.
+ECHO_DELAY_MS = 274
+ECHO_DELAY_SAMPLES = MODEL_RATE * ECHO_DELAY_MS // 1000
+
+# The weights update once per SUB_BLOCK samples rather than once per sample.
+# Measured offline against the per-sample filter in depth_aec/: a whole
+# 512-sample block per update loses about 6dB of cancellation, 64 gets it
+# back (15.97dB against the reference's 16.37dB) and still costs a twentieth
+# of a millisecond. STEP_SIZE is larger than the per-sample version's 0.1
+# because the update is now normalised as an average gradient.
+SUB_BLOCK = 64
+STEP_SIZE = 4.0
 EPSILON = 1e-3
 GEIGEL_THRESHOLD = 0.75
 
@@ -79,21 +105,53 @@ vad_model, _utils = torch.hub.load(
 asr_model = WhisperModel("small", device="cpu", compute_type="int8")
 tts_voice = PiperVoice.load(VOICE_MODEL_PATH)
 
-state = {"is_speaking": False, "silence_chunks": 0, "audio_buffer": []}
+state = {
+    "is_speaking": False,
+    "silence_chunks": 0,
+    "audio_buffer": [],
+    "barge_in_candidate": [],
+    "echo_tail": 0,
+}
 utterance_queue = queue.Queue()
 
 # Holds samples at DEVICE_RATE now, not MODEL_RATE.
 output_buffer: deque = deque()
 output_recording: list = []
+erle_log: list = []
+
+# Raw device-rate mic and speaker blocks, saved on exit so the real echo can
+# be analysed offline: its delay, whether the per-sample filter can cancel
+# it at all, and what per-block resampling does to it.
+capture_mic: list = []
+capture_ref: list = []
 
 
-class IncrementalAEC:
-    """NLMS with Geigel double-talk detection, one block at a time.
+class BlockNLMS:
+    """NLMS with Geigel double-talk detection, updating once per block.
 
-    Unchanged from pass C. It still runs at 16kHz: cancelling at 48kHz would
-    need three times the taps for the same echo tail, and each tap costs
-    three times as many multiplies, so roughly nine times the work for no
-    extra benefit.
+    Pass C walked the block sample by sample, and that is what broke the
+    real-time budget. The prediction loop was never the problem -- it costs
+    about half a millisecond. The weight update was, because it builds a
+    fresh 1600-element array 512 times per block, which came to roughly 23ms
+    in isolation and the full 32ms under load. A callback that misses its
+    deadline makes the output underrun, so the algorithm meant to clean up
+    the audio was itself producing glitches.
+
+    Both halves are really convolutions, and numpy will do them in one call:
+
+      prediction  y[i] = dot(w, ref[i : i+FILTER_LENGTH])
+                       = correlate(ref, w, "valid")
+      gradient    g[j] = sum_i e[i] * ref[i+j]
+                       = correlate(ref, e, "valid")
+
+    Same arithmetic to floating-point precision, about 50x faster. The
+    tradeoff is real but small: weights now adapt once per 32ms block rather
+    than every sample, so the filter converges a little more slowly. This is
+    Block LMS, and it is what practical echo cancellers use, usually in the
+    frequency domain.
+
+    Still running at 16kHz. Cancelling at 48kHz would need three times the
+    taps for the same echo tail, at three times the cost each.
     """
 
     def __init__(self):
@@ -101,27 +159,55 @@ class IncrementalAEC:
         self.ref_history = np.zeros(FILTER_LENGTH)
 
     def process_block(self, mic_block: np.ndarray, ref_block: np.ndarray) -> np.ndarray:
-        combined_ref = np.concatenate([self.ref_history, ref_block])
-        n_block = len(mic_block)
-        residual = np.zeros(n_block)
+        residual = np.empty(len(mic_block))
 
-        for i in range(n_block):
-            x_window = combined_ref[i : i + FILTER_LENGTH]
-            echo_prediction = np.dot(self.w, x_window)
-            error = mic_block[i] - echo_prediction
-            residual[i] = error
+        for k in range(0, len(mic_block), SUB_BLOCK):
+            mic = mic_block[k : k + SUB_BLOCK]
+            ref = ref_block[k : k + SUB_BLOCK]
+            n = len(mic)
 
-            double_talk = abs(mic_block[i]) > GEIGEL_THRESHOLD * max(abs(x_window))
-            if not double_talk:
-                self.w = self.w + (STEP_SIZE * error * x_window) / (
-                    np.dot(x_window, x_window) + EPSILON
-                )
+            combined_ref = np.concatenate([self.ref_history, ref])
+            echo_prediction = np.correlate(combined_ref, self.w, mode="valid")[:n]
+            error = mic - echo_prediction
+            residual[k : k + n] = error
 
-        self.ref_history = combined_ref[-FILTER_LENGTH:]
+            # Geigel, judged once per sub-block: is the mic louder than this
+            # stretch of reference could explain as echo?
+            # Nothing to learn from a silent reference, and it now runs on every
+            # block rather than only during playback.
+            reference_silent = np.abs(combined_ref).max() < 1e-4
+            double_talk = np.abs(mic).max() > GEIGEL_THRESHOLD * np.abs(combined_ref).max()
+            if not reference_silent and not double_talk:
+                gradient = np.correlate(combined_ref, error, mode="valid")[:FILTER_LENGTH]
+                # Normalise by the energy one window sees, times the number of
+                # samples summed into the gradient -- that makes this the
+                # average per-sample update rather than the sum of them. Miss
+                # this and the step is hundreds of times too large, and the
+                # filter diverges instead of converging.
+                window_energy = np.dot(combined_ref, combined_ref) * FILTER_LENGTH / len(combined_ref)
+                self.w += STEP_SIZE * gradient / (n * window_energy + EPSILON)
+
+            self.ref_history = combined_ref[-FILTER_LENGTH:]
+
         return residual
 
 
-aec = IncrementalAEC()
+class DelayLine:
+    """Delays a stream by a fixed number of samples, block in, block out."""
+
+    def __init__(self, delay: int):
+        self.pending = np.zeros(delay)
+
+    def process(self, block: np.ndarray) -> np.ndarray:
+        if len(self.pending) == 0:
+            return block
+        joined = np.concatenate([self.pending, block])
+        out, self.pending = joined[: len(block)], joined[len(block) :]
+        return out
+
+
+aec = BlockNLMS()
+ref_delay = DelayLine(ECHO_DELAY_SAMPLES)
 
 
 def to_device_rate(audio: np.ndarray, orig_sr: int) -> np.ndarray:
@@ -130,12 +216,17 @@ def to_device_rate(audio: np.ndarray, orig_sr: int) -> np.ndarray:
 
 
 def to_model_rate(block: np.ndarray) -> np.ndarray:
-    """One 48kHz block down to 16kHz for the models.
+    """One device-rate block down to 16kHz for the models.
 
     Per-block polyphase resampling has small edge effects at block
     boundaries, since each call filters its block in isolation. It is
     audible to a spectrum plot and not to Whisper.
+
+    Setting DEVICE_RATE to 16000 makes this a no-op, which turns this file
+    into a 16kHz control for the same fast filter.
     """
+    if DOWNSAMPLE == 1:
+        return block
     return resample_poly(block, 1, DOWNSAMPLE)
 
 
@@ -160,6 +251,8 @@ def audio_callback(indata: np.ndarray, outdata: np.ndarray, frames: int, _time, 
     output_recording.append(outdata[:, 0].copy())
 
     mic_block_device = indata[:, 0].astype(np.float64).copy()
+    capture_mic.append(indata[:, 0].copy())
+    capture_ref.append(ref_block_device.astype(np.float32))
 
     t0 = time.time()
     # Both signals come from this same callback invocation and go through the
@@ -168,10 +261,35 @@ def audio_callback(indata: np.ndarray, outdata: np.ndarray, frames: int, _time, 
     ref_block = to_model_rate(ref_block_device)
     t1 = time.time()
 
+    # What we play now reaches the mic ECHO_DELAY later, so the filter is fed
+    # the reference from that long ago rather than the block just written.
+    delayed_ref = ref_delay.process(ref_block)
+
+    # The echo keeps arriving for ECHO_DELAY plus the room tail after the
+    # speaker goes quiet. Until then the assistant is still audible, even
+    # though the output buffer is already empty.
     if n_available > 0:
-        cleaned_block = aec.process_block(mic_block, ref_block)
+        state["echo_tail"] = ECHO_DELAY_SAMPLES + FILTER_LENGTH
     else:
-        cleaned_block = mic_block
+        state["echo_tail"] = max(0, state["echo_tail"] - len(mic_block))
+    assistant_audible = n_available > 0 or state["echo_tail"] > 0
+
+    # Cheap enough to run on every block now, which matters: skipping it
+    # whenever nothing is playing would leave the delayed echo uncancelled.
+    cleaned_block = aec.process_block(mic_block, delayed_ref)
+
+    if np.abs(delayed_ref).max() > 1e-4:
+        # How much echo went away, in dB. Positive means the filter is
+        # cancelling; around zero means it is doing nothing.
+        mic_energy = np.mean(mic_block**2)
+        residual_energy = np.mean(cleaned_block**2)
+        if mic_energy > 1e-9:
+            erle_log.append(10 * np.log10(mic_energy / (residual_energy + 1e-12)))
+        if len(erle_log) >= 4:
+            print(f"  ERLE {np.mean(erle_log):+.1f} dB   mic {np.sqrt(mic_energy):.4f}")
+            erle_log.clear()
+    else:
+        erle_log.clear()
     t2 = time.time()
 
     audio_tensor = torch.from_numpy(cleaned_block).float()
@@ -189,13 +307,30 @@ def audio_callback(indata: np.ndarray, outdata: np.ndarray, frames: int, _time, 
 
     if not state["is_speaking"]:
         if speech_prob > SPEECH_THRESHOLD:
-            print("speech started")
+            if assistant_audible:
+                # The assistant is talking. The filter starts each utterance
+                # knowing nothing about the current echo path, so for the
+                # first stretch of playback the echo comes through barely
+                # cancelled -- and one block of leaked echo looks exactly
+                # like speech. Require a run of detections before believing
+                # a barge-in, keeping the blocks so the interruption is not
+                # clipped when we do believe it.
+                state["barge_in_candidate"].append(audio_tensor)
+                if len(state["barge_in_candidate"]) < BARGE_IN_CHUNKS:
+                    return
+                print("barge-in")
+                output_buffer.clear()
+                state["audio_buffer"] = state["barge_in_candidate"]
+                state["barge_in_candidate"] = []
+            else:
+                print("speech started")
+                state["audio_buffer"] = [audio_tensor]
+
             state["is_speaking"] = True
             state["silence_chunks"] = 0
-            state["audio_buffer"] = [audio_tensor]
-
-            if len(output_buffer):
-                output_buffer.clear()
+        else:
+            # Any quiet block breaks the run.
+            state["barge_in_candidate"] = []
     else:
         state["audio_buffer"].append(audio_tensor)
 
@@ -266,6 +401,14 @@ def main() -> None:
                 "stage6_orchestration/debug_live_output_48k.wav", full_output, DEVICE_RATE
             )
             print("Saved stage6_orchestration/debug_live_output_48k.wav")
+        if capture_mic:
+            np.savez(
+                "stage6_orchestration/debug_aec_capture.npz",
+                mic=np.concatenate(capture_mic),
+                ref=np.concatenate(capture_ref),
+                rate=DEVICE_RATE,
+            )
+            print("Saved stage6_orchestration/debug_aec_capture.npz")
 
 
 if __name__ == "__main__":
